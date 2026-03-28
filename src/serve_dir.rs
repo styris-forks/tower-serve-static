@@ -28,8 +28,12 @@ use tower_service::Service;
 pub struct ServeDir {
     dir: &'static Dir<'static>,
     append_index_html_on_directories: bool,
+    redirect_not_found_to_index_html: bool,
     buf_chunk_size: usize,
+    brotli: bool,
 }
+
+impl ServeDir {}
 
 impl ServeDir {
     /// Create a new [`ServeDir`].
@@ -37,7 +41,9 @@ impl ServeDir {
         Self {
             dir,
             append_index_html_on_directories: true,
+            redirect_not_found_to_index_html: false,
             buf_chunk_size: DEFAULT_CAPACITY,
+            brotli: false,
         }
     }
 
@@ -51,11 +57,34 @@ impl ServeDir {
         self
     }
 
+    /// Redirect to `index.html` when a file is not found.
+    ///
+    /// This is useful for SPA applications.
+    ///
+    /// Defaults to `false`.
+    pub fn redirect_not_found_to_index_html(mut self, redirect: bool) -> Self {
+        self.redirect_not_found_to_index_html = redirect;
+        self
+    }
+
     /// Set a specific read buffer chunk size.
     ///
     /// The default capacity is 64kb.
     pub fn with_buf_chunk_size(mut self, chunk_size: usize) -> Self {
         self.buf_chunk_size = chunk_size;
+        self
+    }
+
+    /// Informs the service that it should also look for a precompressed brotli
+    /// version of _any_ file in the directory.
+    ///
+    /// Assuming the `dir` directory is being served and `dir/foo.txt` is requested,
+    /// a client with an `Accept-Encoding` header that allows the brotli encoding
+    /// will receive the file `dir/foo.txt.br` instead of `dir/foo.txt`.
+    /// If the precompressed file is not available, or the client doesn't support it,
+    /// the uncompressed version will be served instead (if available).
+    pub fn precompressed_br(mut self) -> Self {
+        self.brotli = true;
         self
     }
 }
@@ -111,10 +140,12 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
                 };
             }
         }
-
-        let file = if let Some(file) = self.dir.get_file(&full_path) {
-            file
-        } else {
+        let Some((file, brotli, mime)) = resolve_file(
+            self.dir,
+            &mut full_path,
+            self.brotli && accepts_brotli(req.headers()),
+            self.redirect_not_found_to_index_html,
+        ) else {
             return ResponseFuture {
                 inner: Some(Inner::NotFound),
             };
@@ -127,16 +158,8 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
             };
         }
 
-        let guess = mime_guess::from_path(&full_path);
-        let mime = guess
-            .first_raw()
-            .map(HeaderValue::from_static)
-            .unwrap_or_else(|| {
-                HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap()
-            });
-
         ResponseFuture {
-            inner: Some(Inner::File(file, mime, self.buf_chunk_size)),
+            inner: Some(Inner::File(file, mime, brotli, self.buf_chunk_size)),
         }
     }
 }
@@ -176,8 +199,73 @@ fn append_slash_on_path(uri: Uri) -> Uri {
     builder.build().unwrap()
 }
 
+fn resolve_file(
+    dir: &Dir<'static>,
+    path: &mut PathBuf,
+    brotli: bool,
+    redirect_not_found_to_index_html: bool,
+) -> Option<(&'static File<'static>, bool, HeaderValue)> {
+    if !brotli {
+        if let Some(file) = dir.get_file(&path) {
+            let mime = mime_guess::from_path(&path)
+                .first_raw()
+                .map(HeaderValue::from_static)
+                .unwrap_or_else(|| {
+                    HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap()
+                });
+            return Some((file, false, mime));
+        };
+
+        if !redirect_not_found_to_index_html {
+            return None;
+        }
+
+        if let Some(file) = dir.get_file(&"index.html") {
+            return Some((
+                file,
+                false,
+                HeaderValue::from_str(mime::HTML.as_ref()).unwrap(),
+            ));
+        };
+        return None;
+    }
+
+    let mime = mime_guess::from_path(&path)
+        .first_raw()
+        .map(HeaderValue::from_static)
+        .unwrap_or_else(|| HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap());
+
+    path.add_extension("br");
+    if let Some(file) = dir.get_file(&path) {
+        return Some((file, true, mime));
+    };
+    path.set_extension("");
+    if let Some(file) = dir.get_file(&path) {
+        return Some((file, false, mime));
+    };
+
+    if !redirect_not_found_to_index_html {
+        return None;
+    };
+
+    if let Some(file) = dir.get_file(&"index.html.br") {
+        return Some((
+            file,
+            true,
+            HeaderValue::from_str(mime::HTML.as_ref()).unwrap(),
+        ));
+    };
+    if let Some(file) = dir.get_file(&"index.html") {
+        return Some((
+            file,
+            false,
+            HeaderValue::from_str(mime::HTML.as_ref()).unwrap(),
+        ));
+    };
+    None
+}
 enum Inner {
-    File(&'static File<'static>, HeaderValue, usize),
+    File(&'static File<'static>, HeaderValue, bool, usize),
     Redirect(HeaderValue),
     NotFound,
     Invalid,
@@ -195,12 +283,16 @@ impl Future for ResponseFuture {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.inner.take().unwrap() {
-            Inner::File(file, mime, chunk_size) => {
+            Inner::File(file, mime, brotli, chunk_size) => {
                 let body = AsyncReadBody::with_capacity(file.contents(), chunk_size).boxed();
                 let body = ResponseBody(body);
 
                 let mut res = Response::new(body);
                 res.headers_mut().insert(header::CONTENT_TYPE, mime);
+                if brotli {
+                    res.headers_mut()
+                        .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
+                }
 
                 #[cfg(feature = "metadata")]
                 if let Some(metadata) = file.metadata() {
@@ -249,6 +341,19 @@ fn empty_body() -> ResponseBody {
 opaque_body! {
     /// Response body for [`ServeDir`].
     pub type ResponseBody = BoxBody<Bytes, io::Error>;
+}
+
+fn accepts_brotli<'a>(headers: &'a http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|hval| hval.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(move |v| {
+            let mut v = v.splitn(2, ';');
+
+            v.next().unwrap().trim().eq_ignore_ascii_case("br")
+        })
 }
 
 #[cfg(test)]
