@@ -4,6 +4,7 @@ use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body::Frame;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty};
 use include_dir::{Dir, File};
+use papaya::LocalGuard;
 use percent_encoding::percent_decode;
 use std::{
     convert::Infallible,
@@ -14,6 +15,7 @@ use std::{
     task::{Context, Poll},
 };
 use tower_service::Service;
+use xxhash_rust::xxh3::Xxh3Builder;
 
 /// Service that serves files from a given directory and all its sub directories.
 ///
@@ -27,19 +29,36 @@ use tower_service::Service;
 #[derive(Clone, Debug)]
 pub struct ServeDir {
     dir: &'static Dir<'static>,
+    cache: &'static papaya::HashMap<PathBuf, ServeEntry, Xxh3Builder>,
     append_index_html_on_directories: bool,
     redirect_not_found_to_index_html: bool,
     buf_chunk_size: usize,
     brotli: bool,
 }
 
+/// Represents an entry in the serve directory cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum ServeEntry {
+    File {
+        data: &'static File<'static>,
+        mime: HeaderValue,
+        brotli: bool,
+    },
+    Dir,
+}
+
 impl ServeDir {}
 
 impl ServeDir {
     /// Create a new [`ServeDir`].
-    pub fn new(dir: &'static Dir<'static>) -> Self {
+    pub fn new(
+        dir: &'static Dir<'static>,
+        cache: &'static papaya::HashMap<PathBuf, ServeEntry, Xxh3Builder>,
+    ) -> Self {
         Self {
             dir,
+            cache,
             append_index_html_on_directories: true,
             redirect_not_found_to_index_html: false,
             buf_chunk_size: DEFAULT_CAPACITY,
@@ -123,7 +142,7 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
         }
 
         if !req.uri().path().ends_with('/') {
-            if is_dir(self.dir, &full_path) {
+            if is_dir(self.dir, &mut self.cache, &full_path) {
                 let location =
                     HeaderValue::from_str(&append_slash_on_path(req.uri().clone()).to_string())
                         .unwrap();
@@ -131,7 +150,7 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
                     inner: Some(Inner::Redirect(location)),
                 };
             }
-        } else if is_dir(self.dir, &full_path) {
+        } else if is_dir(self.dir, &mut self.cache, &full_path) {
             if self.append_index_html_on_directories {
                 full_path.push("index.html");
             } else {
@@ -142,6 +161,7 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
         }
         let Some((file, brotli, mime)) = resolve_file(
             self.dir,
+            &mut self.cache,
             &mut full_path,
             self.brotli && accepts_brotli(req.headers()),
             self.redirect_not_found_to_index_html,
@@ -164,11 +184,24 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
     }
 }
 
-fn is_dir(dir: &Dir<'static>, path: &Path) -> bool {
+fn is_dir(
+    dir: &Dir<'static>,
+    cache: &papaya::HashMap<PathBuf, ServeEntry, Xxh3Builder>,
+    path: &Path,
+) -> bool {
     if path.as_os_str() == std::ffi::OsStr::new("") {
         return true;
     }
-    dir.get_dir(path).is_some()
+
+    if let Some(entry) = cache.pin().get(path) {
+        return entry == &ServeEntry::Dir;
+    }
+
+    let result = dir.get_dir(path).is_some();
+    if result {
+        cache.pin().insert(path.to_path_buf(), ServeEntry::Dir);
+    }
+    result
 }
 
 fn append_slash_on_path(uri: Uri) -> Uri {
@@ -199,35 +232,14 @@ fn append_slash_on_path(uri: Uri) -> Uri {
     builder.build().unwrap()
 }
 
-fn resolve_file(
+fn cached_get_file<'a>(
     dir: &Dir<'static>,
+    cache: &'a papaya::HashMapRef<'_, PathBuf, ServeEntry, Xxh3Builder, LocalGuard<'_>>,
     path: &mut PathBuf,
     brotli: bool,
-    redirect_not_found_to_index_html: bool,
-) -> Option<(&'static File<'static>, bool, HeaderValue)> {
-    if !brotli {
-        if let Some(file) = dir.get_file(&path) {
-            let mime = mime_guess::from_path(&path)
-                .first_raw()
-                .map(HeaderValue::from_static)
-                .unwrap_or_else(|| {
-                    HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap()
-                });
-            return Some((file, false, mime));
-        };
-
-        if !redirect_not_found_to_index_html {
-            return None;
-        }
-
-        if let Some(file) = dir.get_file(&"index.html") {
-            return Some((
-                file,
-                false,
-                HeaderValue::from_str(mime::HTML.as_ref()).unwrap(),
-            ));
-        };
-        return None;
+) -> Option<&'a ServeEntry> {
+    if let Some(entry) = cache.get(path) {
+        return Some(entry);
     }
 
     let mime = mime_guess::from_path(&path)
@@ -235,33 +247,113 @@ fn resolve_file(
         .map(HeaderValue::from_static)
         .unwrap_or_else(|| HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap());
 
-    path.add_extension("br");
-    if let Some(file) = dir.get_file(&path) {
-        return Some((file, true, mime));
+    if brotli {
+        path.add_extension("br");
+    }
+
+    let file = match dir.get_file(&path) {
+        Some(f) => f,
+        None => {
+            if brotli {
+                path.set_extension("");
+            } else {
+                return None;
+            }
+            match dir.get_file(&path) {
+                Some(file) => {
+                    cache.insert(
+                        path.clone(),
+                        ServeEntry::File {
+                            data: file,
+                            mime,
+                            brotli: false,
+                        },
+                    );
+                    return Some(cache.get(path).unwrap());
+                }
+                None => return None,
+            }
+        }
     };
-    path.set_extension("");
-    if let Some(file) = dir.get_file(&path) {
-        return Some((file, false, mime));
+
+    if brotli {
+        path.set_extension("");
+    }
+    cache.insert(
+        path.clone(),
+        ServeEntry::File {
+            data: file,
+            mime,
+            brotli: brotli,
+        },
+    );
+    Some(cache.get(path).unwrap())
+}
+
+fn resolve_file(
+    dir: &Dir<'static>,
+    cache: &papaya::HashMap<PathBuf, ServeEntry, Xxh3Builder>,
+    path: &mut PathBuf,
+    brotli: bool,
+    redirect_not_found_to_index_html: bool,
+) -> Option<(&'static File<'static>, bool, HeaderValue)> {
+    if !brotli {
+        let cache = cache.pin();
+        let Some(entry) = cached_get_file(dir, &cache, path, false) else {
+            return None;
+        };
+
+        match entry {
+            ServeEntry::File {
+                data,
+                mime,
+                brotli: cached_brotli,
+            } => {
+                if !cached_brotli {
+                    return Some((*data, false, mime.clone()));
+                } else {
+                    // Slow path, check for uncompressed version
+                    if let Some(file) = dir.get_file(&path) {
+                        return Some((file, false, mime.clone()));
+                    };
+
+                    if !redirect_not_found_to_index_html {
+                        return None;
+                    }
+
+                    if let Some(file) = dir.get_file(&"index.html") {
+                        return Some((
+                            file,
+                            false,
+                            HeaderValue::from_str(mime::HTML.as_ref()).unwrap(),
+                        ));
+                    };
+                }
+                return None;
+            }
+            ServeEntry::Dir => return None,
+        }
+    }
+
+    let cache = cache.pin();
+    if let Some(entry) = cached_get_file(dir, &cache, path, true) {
+        return match entry {
+            ServeEntry::File { data, mime, brotli } => Some((*data, *brotli, mime.clone())),
+            ServeEntry::Dir => None,
+        };
     };
 
     if !redirect_not_found_to_index_html {
         return None;
     };
 
-    if let Some(file) = dir.get_file(&"index.html.br") {
-        return Some((
-            file,
-            true,
-            HeaderValue::from_str(mime::HTML.as_ref()).unwrap(),
-        ));
+    if let Some(entry) = cached_get_file(dir, &cache, &mut PathBuf::from("index.html"), true) {
+        return match entry {
+            ServeEntry::File { data, mime, brotli } => Some((*data, *brotli, mime.clone())),
+            ServeEntry::Dir => None,
+        };
     };
-    if let Some(file) = dir.get_file(&"index.html") {
-        return Some((
-            file,
-            false,
-            HeaderValue::from_str(mime::HTML.as_ref()).unwrap(),
-        ));
-    };
+
     None
 }
 enum Inner {
@@ -358,6 +450,8 @@ fn accepts_brotli<'a>(headers: &'a http::HeaderMap) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     #[allow(unused_imports)]
     use super::*;
     use http::{Request, StatusCode};
@@ -365,11 +459,16 @@ mod tests {
     use include_dir::include_dir;
     use tower::ServiceExt;
 
+    static CLIENT_SERVE_CACHE: OnceLock<papaya::HashMap<PathBuf, ServeEntry, Xxh3Builder>> =
+        OnceLock::new();
     static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/tests/assets");
 
     #[tokio::test]
     async fn basic() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let req = Request::builder()
             .uri("/text.txt")
@@ -397,7 +496,10 @@ mod tests {
     #[cfg(feature = "metadata")]
     #[tokio::test]
     async fn with_if_modified_since() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let modified: httpdate::HttpDate = ASSETS_DIR
             .get_file("text.txt")
@@ -425,7 +527,11 @@ mod tests {
 
     #[tokio::test]
     async fn with_custom_chunk_size() {
-        let svc = ServeDir::new(&ASSETS_DIR).with_buf_chunk_size(1024 * 32);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        )
+        .with_buf_chunk_size(1024 * 32);
 
         let req = Request::builder()
             .uri("/text.txt")
@@ -444,7 +550,10 @@ mod tests {
 
     #[tokio::test]
     async fn access_to_sub_dirs() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let req = Request::builder()
             .uri("/subfolder/data.json")
@@ -463,7 +572,10 @@ mod tests {
 
     #[tokio::test]
     async fn not_found() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let req = Request::builder()
             .uri("/not-found")
@@ -480,7 +592,10 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_to_trailing_slash_on_dir() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let req = Request::builder()
             .uri("/subfolder")
@@ -496,7 +611,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_directory_without_index() {
-        let svc = ServeDir::new(&ASSETS_DIR).append_index_html_on_directories(false);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        )
+        .append_index_html_on_directories(false);
 
         let req = Request::new(http_body_util::Empty::<Bytes>::new());
         let res = svc.oneshot(req).await.unwrap();
@@ -510,7 +629,10 @@ mod tests {
 
     #[tokio::test]
     async fn root_path_with_index() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let req = Request::builder()
             .uri("/")
@@ -538,7 +660,10 @@ mod tests {
 
     #[tokio::test]
     async fn access_cjk_percent_encoded_uri_path() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let req = Request::builder()
             // percent encoding present of 你好世界.txt
@@ -553,7 +678,10 @@ mod tests {
 
     #[tokio::test]
     async fn access_space_percent_encoded_uri_path() {
-        let svc = ServeDir::new(&ASSETS_DIR);
+        let svc = ServeDir::new(
+            &ASSETS_DIR,
+            CLIENT_SERVE_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+        );
 
         let req = Request::builder()
             // percent encoding present of "filename with space.txt"

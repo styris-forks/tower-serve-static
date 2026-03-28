@@ -10,7 +10,7 @@
 //! let service = ServeFile::new(include_file!("/README.md"));
 //!
 //! // Run our service using `axum`
-//! let app = axum::Router::new().nest_service("/", service);
+//! let app = axum::Router::new().fallback_service(service);
 //!
 //! # async {
 //! // run our app with axum, listening locally on port 3000
@@ -23,16 +23,24 @@
 //! # Serve Static Directory
 //!
 //! ```
-//! use tower_serve_static::{ServeDir};
+//! use tower_serve_static::{ServeDir, ServeEntry};
 //! use include_dir::{Dir, include_dir};
+//! use std::sync::OnceLock;
+//! use std::path::PathBuf;
+//! use xxhash_rust::xxh3::Xxh3Builder;
+//!
 //!
 //! // Use `$CARGO_MANIFEST_DIR` to make path relative to your package.
 //! // This will embed and serve files in the `src` directory and its subdirectories.
 //! static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src");
-//! let service = ServeDir::new(&ASSETS_DIR);
+//! static SERVE_DIR_CACHE: OnceLock<papaya::HashMap<PathBuf, ServeEntry, Xxh3Builder>> = OnceLock::new();
+//! let service = ServeDir::new(
+//!     &ASSETS_DIR,
+//!     SERVE_DIR_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
+//! );
 //!
 //! // Run our service using `axum`
-//! let app = axum::Router::new().nest_service("/", service);
+//! let app = axum::Router::new().fallback_service(service);
 //!
 //! // run our app with axum, listening locally on port 3000
 //! # async {
@@ -81,6 +89,7 @@ const DEFAULT_CAPACITY: usize = 65536;
 pub use self::{
     serve_dir::{
         ResponseBody as ServeDirResponseBody, ResponseFuture as ServeDirResponseFuture, ServeDir,
+        ServeEntry,
     },
     serve_file::{
         File, ResponseBody as ServeFileResponseBody, ResponseFuture as ServeFileResponseFuture,
