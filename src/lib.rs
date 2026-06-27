@@ -23,21 +23,23 @@
 //! # Serve Static Directory
 //!
 //! ```
-//! use tower_serve_static::{ServeDir, ServeEntry};
+//! use tower_serve_static::{ServeDir, ServeSettingsMap};
 //! use include_dir::{Dir, include_dir};
 //! use std::sync::OnceLock;
-//! use std::path::PathBuf;
 //! use xxhash_rust::xxh3::Xxh3Builder;
 //!
 //!
 //! // Use `$CARGO_MANIFEST_DIR` to make path relative to your package.
 //! // This will embed and serve files in the `src` directory and its subdirectories.
 //! static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src");
-//! static SERVE_DIR_CACHE: OnceLock<papaya::HashMap<PathBuf, ServeEntry, Xxh3Builder>> = OnceLock::new();
+//! static SERVE_SETTINGS: OnceLock<ServeSettingsMap> = OnceLock::new();
 //! let service = ServeDir::new(
 //!     &ASSETS_DIR,
-//!     SERVE_DIR_CACHE.get_or_init(|| papaya::HashMap::with_hasher(Xxh3Builder::default())),
-//! );
+//!     SERVE_SETTINGS.get_or_init(|| ServeSettingsMap::with_hasher(Xxh3Builder::default())),
+//! )
+//! // serve `index.html` uncached; fingerprinted assets get a long, immutable cache.
+//! .default_cache_control("no-cache")
+//! .cache_control("assets", "public, max-age=31536000, immutable");
 //!
 //! // Run our service using `axum`
 //! let app = axum::Router::new().fallback_service(service);
@@ -89,7 +91,7 @@ const DEFAULT_CAPACITY: usize = 65536;
 pub use self::{
     serve_dir::{
         ResponseBody as ServeDirResponseBody, ResponseFuture as ServeDirResponseFuture, ServeDir,
-        ServeEntry,
+        ServeSettings, ServeSettingsMap,
     },
     serve_file::{
         File, ResponseBody as ServeFileResponseBody, ResponseFuture as ServeFileResponseFuture,
