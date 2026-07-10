@@ -149,7 +149,8 @@ impl ServeDir {
     /// Default `Cache-Control` value sent for every served file, unless a more specific
     /// per-path setting overrides it.
     pub fn default_cache_control(mut self, value: &str) -> Self {
-        self.default_settings.set_cache_control(parse_header_value(value));
+        self.default_settings
+            .set_cache_control(parse_header_value(value));
         self
     }
 
@@ -166,13 +167,17 @@ impl ServeDir {
     /// path (`""`) targets the whole served tree.
     pub fn cache_control(self, path: impl AsRef<Path>, value: &str) -> Self {
         let value = parse_header_value(value);
-        self.apply(path.as_ref(), &|settings| settings.set_cache_control(value.clone()))
+        self.apply(path.as_ref(), &|settings| {
+            settings.set_cache_control(value.clone())
+        })
     }
 
     /// Set an extra response header for a specific file, or recursively for a directory
     /// (same path semantics as [`ServeDir::cache_control`]).
     pub fn header(self, path: impl AsRef<Path>, name: HeaderName, value: HeaderValue) -> Self {
-        self.apply(path.as_ref(), &|settings| settings.set_header(name.clone(), value.clone()))
+        self.apply(path.as_ref(), &|settings| {
+            settings.set_header(name.clone(), value.clone())
+        })
     }
 
     /// Send `Cache-Control: no-cache` for a file or directory (forces revalidation).
@@ -270,9 +275,16 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
 
         if !req.uri().path().ends_with('/') {
             if is_dir(self.dir, &full_path) {
-                let location =
-                    HeaderValue::from_str(&append_slash_on_path(req.uri().clone()).to_string())
-                        .unwrap();
+                let Ok(appended_uri) = append_slash_on_path(req.uri().clone()) else {
+                    return ResponseFuture {
+                        inner: Some(Inner::Invalid),
+                    };
+                };
+                let Ok(location) = HeaderValue::from_str(&appended_uri.to_string()) else {
+                    return ResponseFuture {
+                        inner: Some(Inner::Invalid),
+                    };
+                };
                 return ResponseFuture {
                     inner: Some(Inner::Redirect(location)),
                 };
@@ -429,32 +441,21 @@ fn try_resolve(dir: &'static Dir<'static>, logical: &Path, brotli: bool) -> Opti
     })
 }
 
-fn append_slash_on_path(uri: Uri) -> Uri {
-    let http::uri::Parts {
-        scheme,
-        authority,
-        path_and_query,
-        ..
-    } = uri.into_parts();
+fn append_slash_on_path(uri: Uri) -> Result<Uri, Inner> {
+    let path_and_query = uri.into_parts().path_and_query;
 
-    let mut builder = Uri::builder();
-    if let Some(scheme) = scheme {
-        builder = builder.scheme(scheme);
-    }
-    if let Some(authority) = authority {
-        builder = builder.authority(authority);
-    }
-    if let Some(path_and_query) = path_and_query {
-        if let Some(query) = path_and_query.query() {
-            builder = builder.path_and_query(format!("{}/?{}", path_and_query.path(), query));
-        } else {
-            builder = builder.path_and_query(format!("{}/", path_and_query.path()));
-        }
-    } else {
-        builder = builder.path_and_query("/");
-    }
+    let new_path_and_query = match path_and_query {
+        Some(path_and_query) => match path_and_query.query() {
+            Some(query) => format!("{}/?{}", path_and_query.path(), query),
+            None => format!("{}/", path_and_query.path()),
+        },
+        None => "/".to_string(),
+    };
 
-    builder.build().unwrap()
+    Uri::builder()
+        .path_and_query(new_path_and_query)
+        .build()
+        .map_err(|_| Inner::Invalid)
 }
 
 enum Inner {
@@ -569,8 +570,9 @@ fn accepts_brotli(headers: &http::HeaderMap) -> bool {
         .flat_map(|s| s.split(','))
         .any(move |v| {
             let mut v = v.splitn(2, ';');
+            let split = v.next().unwrap_or("");
 
-            v.next().unwrap().trim().eq_ignore_ascii_case("br")
+            split.trim().eq_ignore_ascii_case("br")
         })
 }
 
@@ -594,7 +596,9 @@ mod tests {
 
     /// A fresh, isolated settings map (leaked to `'static`) for tests that mutate it.
     fn fresh_settings() -> &'static ServeSettingsMap {
-        Box::leak(Box::new(ServeSettingsMap::with_hasher(Xxh3Builder::default())))
+        Box::leak(Box::new(ServeSettingsMap::with_hasher(
+            Xxh3Builder::default(),
+        )))
     }
 
     #[tokio::test]
@@ -626,7 +630,8 @@ mod tests {
 
     #[tokio::test]
     async fn cache_control_for_file() {
-        let svc = ServeDir::new(&ASSETS_DIR, fresh_settings()).cache_control("text.txt", "no-cache");
+        let svc =
+            ServeDir::new(&ASSETS_DIR, fresh_settings()).cache_control("text.txt", "no-cache");
 
         let req = Request::builder()
             .uri("/text.txt")
@@ -842,7 +847,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty_directory_without_index() {
-        let svc = ServeDir::new(&ASSETS_DIR, shared_settings()).append_index_html_on_directories(false);
+        let svc =
+            ServeDir::new(&ASSETS_DIR, shared_settings()).append_index_html_on_directories(false);
 
         let req = Request::new(http_body_util::Empty::<Bytes>::new());
         let res = svc.oneshot(req).await.unwrap();
