@@ -1,18 +1,13 @@
-use super::{AsyncReadBody, DEFAULT_CAPACITY};
-use bytes::Bytes;
-use http::{header, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
-use http_body::Frame;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty};
+use crate::response::{empty, etag, method_not_allowed, respond, ResponseBody, ResponseFuture};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use include_dir::{Dir, File};
 use papaya::LocalGuard;
 use percent_encoding::percent_decode;
 use std::{
     convert::Infallible,
     ffi::OsString,
-    future::Future,
-    io,
     path::{Path, PathBuf},
-    pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tower_service::Service;
@@ -46,7 +41,7 @@ impl ServeSettings {
     }
 
     fn set_header(&mut self, name: HeaderName, value: HeaderValue) {
-        self.headers.retain(|(existing, _)| existing != &name);
+        self.headers.retain(|(existing, _)| *existing != name);
         self.headers.push((name, value));
     }
 
@@ -84,8 +79,9 @@ pub struct ServeDir {
     default_settings: ServeSettings,
     append_index_html_on_directories: bool,
     redirect_not_found_to_index_html: bool,
-    buf_chunk_size: usize,
     brotli: bool,
+    /// Entity tags hashed on first use, keyed by the address of the file's contents
+    etags: Arc<papaya::HashMap<usize, HeaderValue, Xxh3Builder>>,
 }
 
 impl ServeDir {
@@ -100,8 +96,8 @@ impl ServeDir {
             default_settings: ServeSettings::default(),
             append_index_html_on_directories: true,
             redirect_not_found_to_index_html: false,
-            buf_chunk_size: DEFAULT_CAPACITY,
             brotli: false,
+            etags: Arc::default(),
         }
     }
 
@@ -122,14 +118,6 @@ impl ServeDir {
     /// Defaults to `false`.
     pub fn redirect_not_found_to_index_html(mut self, redirect: bool) -> Self {
         self.redirect_not_found_to_index_html = redirect;
-        self
-    }
-
-    /// Set a specific read buffer chunk size.
-    ///
-    /// The default capacity is 64kb.
-    pub fn with_buf_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.buf_chunk_size = chunk_size;
         self
     }
 
@@ -238,6 +226,94 @@ impl ServeDir {
         }
         settings
     }
+
+    fn etag(&self, file: &'static File<'static>) -> HeaderValue {
+        let key = file.contents().as_ptr() as usize;
+        let etags = self.etags.pin();
+        etags
+            .get_or_insert_with(key, || etag(file.contents()))
+            .clone()
+    }
+
+    fn respond<B>(&self, req: &Request<B>) -> Response<ResponseBody> {
+        if let Some(res) = method_not_allowed(req) {
+            return res;
+        }
+
+        // build and validate the path
+        let path = req.uri().path();
+        let path = path.trim_start_matches('/');
+
+        let Ok(path_decoded) = percent_decode(path.as_ref()).decode_utf8() else {
+            return empty(StatusCode::NOT_FOUND);
+        };
+
+        let mut full_path = PathBuf::new();
+        for seg in path_decoded.split('/') {
+            if seg.starts_with("..") || seg.contains('\\') {
+                return empty(StatusCode::NOT_FOUND);
+            }
+            full_path.push(seg);
+        }
+
+        if !req.uri().path().ends_with('/') {
+            if is_dir(self.dir, &full_path) {
+                return match slash_appended(req.uri()) {
+                    Some(location) => {
+                        let mut res = empty(StatusCode::TEMPORARY_REDIRECT);
+                        res.headers_mut().insert(header::LOCATION, location);
+                        res
+                    }
+                    None => empty(StatusCode::NOT_FOUND),
+                };
+            }
+        } else if is_dir(self.dir, &full_path) {
+            if !self.append_index_html_on_directories {
+                return empty(StatusCode::NOT_FOUND);
+            }
+            full_path.push("index.html");
+        }
+
+        let Some(resolved) = resolve_file(
+            self.dir,
+            &full_path,
+            self.brotli && accepts_brotli(req.headers()),
+            self.redirect_not_found_to_index_html,
+        ) else {
+            return empty(StatusCode::NOT_FOUND);
+        };
+
+        let settings = self.effective_settings(&resolved.logical);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, resolved.mime);
+        if resolved.brotli {
+            headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
+        }
+        // The resource is content-negotiated whenever brotli is enabled, even if
+        // this particular client didn't accept it, so the response varies.
+        if self.brotli {
+            headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+        }
+        if let Some(cache_control) = settings.cache_control {
+            headers.insert(header::CACHE_CONTROL, cache_control);
+        }
+        for (name, value) in settings.headers {
+            headers.insert(name, value);
+        }
+
+        #[cfg(feature = "metadata")]
+        let last_modified = resolved.file.metadata().map(|metadata| metadata.modified());
+        #[cfg(not(feature = "metadata"))]
+        let last_modified = None;
+
+        respond(
+            req,
+            resolved.file.contents(),
+            self.etag(resolved.file),
+            last_modified,
+            headers,
+        )
+    }
 }
 
 impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
@@ -251,87 +327,7 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // build and validate the path
-        let path = req.uri().path();
-        let path = path.trim_start_matches('/');
-
-        let path_decoded = if let Ok(decoded_utf8) = percent_decode(path.as_ref()).decode_utf8() {
-            decoded_utf8
-        } else {
-            return ResponseFuture {
-                inner: Some(Inner::Invalid),
-            };
-        };
-
-        let mut full_path = PathBuf::new();
-        for seg in path_decoded.split('/') {
-            if seg.starts_with("..") || seg.contains('\\') {
-                return ResponseFuture {
-                    inner: Some(Inner::Invalid),
-                };
-            }
-            full_path.push(seg);
-        }
-
-        if !req.uri().path().ends_with('/') {
-            if is_dir(self.dir, &full_path) {
-                let Ok(appended_uri) = append_slash_on_path(req.uri().clone()) else {
-                    return ResponseFuture {
-                        inner: Some(Inner::Invalid),
-                    };
-                };
-                let Ok(location) = HeaderValue::from_str(&appended_uri.to_string()) else {
-                    return ResponseFuture {
-                        inner: Some(Inner::Invalid),
-                    };
-                };
-                return ResponseFuture {
-                    inner: Some(Inner::Redirect(location)),
-                };
-            }
-        } else if is_dir(self.dir, &full_path) {
-            if self.append_index_html_on_directories {
-                full_path.push("index.html");
-            } else {
-                return ResponseFuture {
-                    inner: Some(Inner::NotFound),
-                };
-            }
-        }
-
-        let Some(resolved) = resolve_file(
-            self.dir,
-            &full_path,
-            self.brotli && accepts_brotli(req.headers()),
-            self.redirect_not_found_to_index_html,
-        ) else {
-            return ResponseFuture {
-                inner: Some(Inner::NotFound),
-            };
-        };
-
-        #[cfg(feature = "metadata")]
-        if super::unmodified_since_request_condition(resolved.file, &req) {
-            return ResponseFuture {
-                inner: Some(Inner::NotModified),
-            };
-        }
-
-        let settings = self.effective_settings(&resolved.logical);
-
-        ResponseFuture {
-            inner: Some(Inner::File {
-                file: resolved.file,
-                mime: resolved.mime,
-                brotli: resolved.brotli,
-                // The resource is content-negotiated whenever brotli is enabled, even if
-                // this particular client didn't accept it, so the response varies.
-                vary_accept_encoding: self.brotli,
-                chunk_size: self.buf_chunk_size,
-                cache_control: settings.cache_control,
-                headers: settings.headers,
-            }),
-        }
+        std::future::ready(Ok(self.respond(&req)))
     }
 }
 
@@ -441,10 +437,10 @@ fn try_resolve(dir: &'static Dir<'static>, logical: &Path, brotli: bool) -> Opti
     })
 }
 
-fn append_slash_on_path(uri: Uri) -> Result<Uri, Inner> {
-    let path_and_query = uri.into_parts().path_and_query;
-
-    let new_path_and_query = match path_and_query {
+/// The `Location` for `uri` with a slash after its path, keeping only the path and query so it
+/// stays relative to whatever scheme and authority the request came in on.
+fn slash_appended(uri: &Uri) -> Option<HeaderValue> {
+    let new_path_and_query = match uri.path_and_query() {
         Some(path_and_query) => match path_and_query.query() {
             Some(query) => format!("{}/?{}", path_and_query.path(), query),
             None => format!("{}/", path_and_query.path()),
@@ -452,128 +448,41 @@ fn append_slash_on_path(uri: Uri) -> Result<Uri, Inner> {
         None => "/".to_string(),
     };
 
-    Uri::builder()
+    let uri = Uri::builder()
         .path_and_query(new_path_and_query)
         .build()
-        .map_err(|_| Inner::Invalid)
+        .ok()?;
+    HeaderValue::from_str(&uri.to_string()).ok()
 }
 
-enum Inner {
-    File {
-        file: &'static File<'static>,
-        mime: HeaderValue,
-        brotli: bool,
-        vary_accept_encoding: bool,
-        chunk_size: usize,
-        cache_control: Option<HeaderValue>,
-        headers: Vec<(HeaderName, HeaderValue)>,
-    },
-    Redirect(HeaderValue),
-    NotFound,
-    Invalid,
-    #[cfg(feature = "metadata")]
-    NotModified,
-}
-
-/// Response future of [`ServeDir`].
-pub struct ResponseFuture {
-    inner: Option<Inner>,
-}
-
-impl Future for ResponseFuture {
-    type Output = Result<Response<ResponseBody>, Infallible>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner.take().unwrap() {
-            Inner::File {
-                file,
-                mime,
-                brotli,
-                vary_accept_encoding,
-                chunk_size,
-                cache_control,
-                headers,
-            } => {
-                let body = AsyncReadBody::with_capacity(file.contents(), chunk_size).boxed();
-                let body = ResponseBody(body);
-
-                let mut res = Response::new(body);
-                let res_headers = res.headers_mut();
-                res_headers.insert(header::CONTENT_TYPE, mime);
-                if brotli {
-                    res_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
-                }
-                if vary_accept_encoding {
-                    res_headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
-                }
-                if let Some(cache_control) = cache_control {
-                    res_headers.insert(header::CACHE_CONTROL, cache_control);
-                }
-                for (name, value) in headers {
-                    res_headers.insert(name, value);
-                }
-
-                #[cfg(feature = "metadata")]
-                if let Some(metadata) = file.metadata() {
-                    let modified = httpdate::HttpDate::from(metadata.modified()).to_string();
-                    let value = HeaderValue::from_str(&modified).expect("SystemTime format");
-                    res.headers_mut().insert(header::LAST_MODIFIED, value);
-                }
-
-                Poll::Ready(Ok(res))
-            }
-            Inner::Redirect(location) => {
-                let res = Response::builder()
-                    .header(http::header::LOCATION, location)
-                    .status(StatusCode::TEMPORARY_REDIRECT)
-                    .body(empty_body())
-                    .unwrap();
-
-                Poll::Ready(Ok(res))
-            }
-            Inner::NotFound | Inner::Invalid => {
-                let res = Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(empty_body())
-                    .unwrap();
-
-                Poll::Ready(Ok(res))
-            }
-            #[cfg(feature = "metadata")]
-            Inner::NotModified => {
-                let res = Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .body(empty_body())
-                    .unwrap();
-
-                Poll::Ready(Ok(res))
-            }
+/// Whether `Accept-Encoding` allows brotli, either by name or through `*`. A weight of `q=0`
+/// refuses it, and so does a weight that doesn't parse.
+fn accepts_brotli(headers: &HeaderMap) -> bool {
+    let mut wildcard = false;
+    for coding in headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+    {
+        let mut params = coding.split(';');
+        let name = params.next().unwrap_or("").trim();
+        let accepted = params
+            .find_map(|param| {
+                let (key, weight) = param.split_once('=')?;
+                key.trim()
+                    .eq_ignore_ascii_case("q")
+                    .then(|| weight.trim().parse::<f32>().is_ok_and(|q| q > 0.0))
+            })
+            .unwrap_or(true);
+        if name.eq_ignore_ascii_case("br") {
+            return accepted;
+        }
+        if name == "*" {
+            wildcard = accepted;
         }
     }
-}
-
-fn empty_body() -> ResponseBody {
-    let body = Empty::new().map_err(|err| match err {}).boxed();
-    ResponseBody(body)
-}
-
-opaque_body! {
-    /// Response body for [`ServeDir`].
-    pub type ResponseBody = BoxBody<Bytes, io::Error>;
-}
-
-fn accepts_brotli(headers: &http::HeaderMap) -> bool {
-    headers
-        .get_all(http::header::ACCEPT_ENCODING)
-        .iter()
-        .filter_map(|hval| hval.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .any(move |v| {
-            let mut v = v.splitn(2, ';');
-            let split = v.next().unwrap_or("");
-
-            split.trim().eq_ignore_ascii_case("br")
-        })
+    wildcard
 }
 
 #[cfg(test)]
@@ -582,8 +491,9 @@ mod tests {
 
     #[allow(unused_imports)]
     use super::*;
-    use http::{Request, StatusCode};
+    use bytes::Bytes;
     use http_body::Body as HttpBody;
+    use http_body_util::BodyExt;
     use include_dir::include_dir;
     use tower::ServiceExt;
 
@@ -770,27 +680,8 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
         assert!(!res.headers().contains_key("content-type"));
-        assert!(!res.headers().contains_key("last-modified"));
+        assert!(res.headers().contains_key("last-modified"));
         assert!(body_into_text(res.into_body()).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn with_custom_chunk_size() {
-        let svc = ServeDir::new(&ASSETS_DIR, shared_settings()).with_buf_chunk_size(1024 * 32);
-
-        let req = Request::builder()
-            .uri("/text.txt")
-            .body(http_body_util::Empty::<Bytes>::new())
-            .unwrap();
-        let res = svc.oneshot(req).await.unwrap();
-
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(res.headers()["content-type"], "text/plain");
-
-        let body = body_into_text(res.into_body()).await;
-
-        let contents = std::fs::read_to_string("./tests/assets/text.txt").unwrap();
-        assert_eq!(body, contents);
     }
 
     #[tokio::test]

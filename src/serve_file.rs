@@ -1,13 +1,7 @@
-use super::{AsyncReadBody, DEFAULT_CAPACITY};
-use bytes::Bytes;
-use http::{header, HeaderValue, Response};
-use http_body::Frame;
-use http_body_util::{combinators::BoxBody, BodyExt};
+use crate::response::{etag, method_not_allowed, respond, ResponseBody, ResponseFuture};
+use http::{header, HeaderMap, HeaderValue, Request, Response};
 use std::{
     convert::Infallible,
-    future::Future,
-    io,
-    pin::Pin,
     task::{Context, Poll},
 };
 use tower_service::Service;
@@ -57,11 +51,11 @@ macro_rules! include_file {
 #[macro_export]
 macro_rules! include_file_with_mime {
     ($file:expr, $mime:expr) => {
-        $crate::File {
-            bytes: ::std::include_bytes!(::std::concat!(::std::env!("CARGO_MANIFEST_DIR"), $file)),
-            mime: $crate::private::http::HeaderValue::from_str($mime.as_ref())
+        $crate::File::new(
+            ::std::include_bytes!(::std::concat!(::std::env!("CARGO_MANIFEST_DIR"), $file)),
+            $crate::private::http::HeaderValue::from_str($mime.as_ref())
                 .expect("mime isn't a valid header value"),
-        }
+        )
     };
 }
 
@@ -69,28 +63,18 @@ macro_rules! include_file_with_mime {
 #[derive(Clone, Debug)]
 pub struct ServeFile {
     file: File,
-    buf_chunk_size: usize,
+    etag: HeaderValue,
 }
 
 impl ServeFile {
     /// Create a new [`ServeFile`].
     pub fn new(file: File) -> Self {
-        Self {
-            file,
-            buf_chunk_size: DEFAULT_CAPACITY,
-        }
-    }
-
-    /// Set a specific read buffer chunk size.
-    ///
-    /// The default capacity is 64kb.
-    pub fn with_buf_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.buf_chunk_size = chunk_size;
-        self
+        let etag = etag(file.bytes);
+        Self { file, etag }
     }
 }
 
-impl<R> Service<R> for ServeFile {
+impl<B> Service<Request<B>> for ServeFile {
     type Response = Response<ResponseBody>;
     type Error = Infallible;
     type Future = ResponseFuture;
@@ -100,69 +84,26 @@ impl<R> Service<R> for ServeFile {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _req: R) -> Self::Future {
-        ResponseFuture {
-            file: Some(self.file.clone()),
-            buf_chunk_size: self.buf_chunk_size,
-        }
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        std::future::ready(Ok(method_not_allowed(&req).unwrap_or_else(|| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, self.file.mime.clone());
+            respond(&req, self.file.bytes, self.etag.clone(), None, headers)
+        })))
     }
-}
-
-/// Response future of [`ServeFile`].
-pub struct ResponseFuture {
-    file: Option<File>,
-    buf_chunk_size: usize,
-}
-
-impl Future for ResponseFuture {
-    type Output = Result<Response<ResponseBody>, Infallible>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let file = self.file.take().unwrap();
-
-        let chunk_size = self.buf_chunk_size;
-        let body = AsyncReadBody::with_capacity(file.bytes, chunk_size).boxed();
-        let body = ResponseBody(body);
-
-        let mut res = Response::new(body);
-        res.headers_mut().insert(header::CONTENT_TYPE, file.mime);
-
-        Poll::Ready(Ok(res))
-    }
-}
-
-opaque_body! {
-    /// Response body for [`ServeFile`].
-    pub type ResponseBody = BoxBody<Bytes, io::Error>;
 }
 
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
     use super::*;
-    use http::Request;
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     #[tokio::test]
     async fn basic() {
         let svc = ServeFile::new(include_file!("/README.md"));
-
-        let res = svc
-            .oneshot(Request::new(http_body_util::Empty::<Bytes>::new()))
-            .await
-            .unwrap();
-
-        assert_eq!(res.headers()["content-type"], "text/markdown");
-
-        let body = res.into_body().collect().await.unwrap();
-        let body = String::from_utf8(body.to_bytes().to_vec()).unwrap();
-
-        assert!(body.starts_with("# Tower Serve Static"));
-    }
-
-    #[tokio::test]
-    async fn with_custom_chunk_size() {
-        let svc = ServeFile::new(include_file!("/README.md")).with_buf_chunk_size(1024 * 32);
 
         let res = svc
             .oneshot(Request::new(http_body_util::Empty::<Bytes>::new()))

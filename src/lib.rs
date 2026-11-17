@@ -1,5 +1,10 @@
 //! Tower file services embedding assets into the binary.
 //!
+//! Both services answer `GET` and `HEAD` only (anything else gets `405`) and send an `ETag`
+//! hashed from the content, a `Content-Length`, and `Accept-Ranges: bytes`. They answer
+//! `If-Match`, `If-None-Match`, `If-Modified-Since`, `Range` and `If-Range` through
+//! [`conditional::evaluate`], which is also public for bodies served some other way.
+//!
 //! # Serve Static File
 //!
 //! ```
@@ -56,14 +61,16 @@
 //!
 //! This library exposes the following features that can be enabled:
 //!
-//! - `metadata` - enables [`ServeDir`] to include the `Last-Modified` header in the response headers.
-//!   Additionally, it enables responding with a suitable reply for `If-Modified-Since` conditional requests.
+//! - `metadata` - enables [`ServeDir`] to send the embedded files' `Last-Modified` and to answer
+//!   `If-Modified-Since` and date-based `If-Range` with it.
 
 #![deny(rust_2018_idioms, missing_docs)]
 
 #[macro_use]
 mod macros;
 
+pub mod conditional;
+mod response;
 mod serve_dir;
 mod serve_file;
 
@@ -72,106 +79,8 @@ pub mod private {
     pub use {http, mime, mime_guess};
 }
 
-use bytes::Bytes;
-use http_body::{Body, Frame};
-use pin_project::pin_project;
-use std::{
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
-use tokio::io::AsyncRead;
-
-use futures_util::Stream;
-use tokio_util::io::ReaderStream;
-
-// default capacity 64KiB
-const DEFAULT_CAPACITY: usize = 65536;
-
 pub use self::{
-    serve_dir::{
-        ResponseBody as ServeDirResponseBody, ResponseFuture as ServeDirResponseFuture, ServeDir,
-        ServeSettings, ServeSettingsMap,
-    },
-    serve_file::{
-        File, ResponseBody as ServeFileResponseBody, ResponseFuture as ServeFileResponseFuture,
-        ServeFile,
-    },
+    response::{ResponseBody, ResponseFuture},
+    serve_dir::{ServeDir, ServeSettings, ServeSettingsMap},
+    serve_file::{File, ServeFile},
 };
-
-// NOTE: This could potentially be upstreamed to `http-body`.
-/// Adapter that turns an `impl AsyncRead` to an `impl Body`.
-#[pin_project]
-#[derive(Debug)]
-pub struct AsyncReadBody<T> {
-    #[pin]
-    reader: ReaderStream<T>,
-}
-
-impl<T> AsyncReadBody<T>
-where
-    T: AsyncRead,
-{
-    /// Create a new [`AsyncReadBody`] wrapping the given reader,
-    /// with a specific read buffer capacity
-    fn with_capacity(read: T, capacity: usize) -> Self {
-        Self {
-            reader: ReaderStream::with_capacity(read, capacity),
-        }
-    }
-}
-
-impl<T> Body for AsyncReadBody<T>
-where
-    T: AsyncRead,
-{
-    type Data = Bytes;
-    type Error = io::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.project().reader.poll_next(cx).map(|res| match res {
-            Some(Ok(buf)) => Some(Ok(Frame::data(buf))),
-            Some(Err(err)) => Some(Err(err)),
-            None => None,
-        })
-    }
-}
-
-#[cfg(feature = "metadata")]
-fn unmodified_since_request_condition<T>(
-    file: &include_dir::File<'_>,
-    req: &http::Request<T>,
-) -> bool {
-    use http::{header, Method};
-    use httpdate::HttpDate;
-
-    let Some(metadata) = file.metadata() else {
-        return false;
-    };
-
-    // If-Modified-Since header spec says:
-    //
-    // > When used in combination with If-None-Match, it is ignored, unless the server doesn't support If-None-Match.
-    //
-    // We can ignore the If-None-Match header is exists or not, because we currently do not support If-None-Match.
-
-    // If-Modified-Since can only be used with a GET or HEAD.
-    match req.method() {
-        &Method::GET | &Method::HEAD => (),
-        _ => return false,
-    }
-
-    let Some(since) = req
-        .headers()
-        .get(header::IF_MODIFIED_SINCE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<HttpDate>().ok())
-    else {
-        return false;
-    };
-
-    metadata.modified() <= since.into()
-}
